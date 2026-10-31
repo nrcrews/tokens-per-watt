@@ -1,27 +1,35 @@
 # tokens-per-watt
 
-How much LLM inference speed does a GPU lose when you cut its power limit? This measures it,
-**split into the two halves of inference**:
+How does a GPU's power limit change inference speed? This measures it separately for the two
+halves of inference, because they respond very differently.
 
-- **Decode** (writing tokens) streams every weight from memory for each step and does little math
-  per byte. The expectation is that it barely notices a lower power limit.
-- **Prefill** (reading the prompt) is dense math. The expectation is that it slows roughly with
-  the clock that the power limit allows.
+On an H100 SXM capped at 415 W instead of 700 W, decode keeps 96% of its speed and prefill 74–75%.
+Decode gets 23–27% more tokens per joule.
 
-Most power-capping results report one blended number. Split, they say something useful: where a
-power budget is the constraint, capping every card can serve more tokens from the same megawatt.
+![Decode and prefill speed against the power limit, Qwen3-8B on H100 SXM](results/h100-sxm/charts/qwen3-8b/light/speed.png)
+
+## Why
+
+- **Decode waits on memory.** Each step streams every weight from HBM and does little math per
+  byte. A cap lowers the core clock, not memory bandwidth, so slower cores mostly wait less.
+- **Prefill is math.** Thousands of prompt tokens per weight read keep the cores busy, so its
+  speed follows the clock.
+- **Capping saves energy.** Power rises with voltage squared, and a lower clock lets the voltage
+  drop, so energy per token falls faster than speed. Uncapped, decode draws only 520–535 W:
+  the top of the range buys it nothing.
+- **Batches feel it more.** More requests in flight means more math per weight read, so decode
+  starts to behave like prefill.
+- **Too low, and it backfires.** Below about 345 W on the SXM card the clock collapses, to
+  345 MHz at 200 W, and decode loses speed faster than it saves power. Likely cause: voltage
+  reaches its floor, so further cuts come only from the clock, while memory and the rest of the
+  board keep their share of the limit. The PCIe card, with less board to feed, still runs at
+  900 MHz at 200 W and keeps 87% of decode speed.
 
 ## Results
 
 Two eight-card H100 machines, one vLLM 0.32.0 engine per card: four cards serving Qwen3-8B,
-four serving Qwen3-14B. Each card is normalised to its own uncapped run, and the figures are the
-median across a model's four cards, at 32 requests in flight unless noted. Raw measurements are
-the `gpu*.jsonl` files in each results folder (`gpu0`–`3` Qwen3-8B, `gpu4`–`7` Qwen3-14B), next to
-every chart in light and dark.
-
-Each engine ran as `vllm serve MODEL --no-enable-prefix-caching --max-num-seqs 64
---max-model-len 8192` (image `vllm/vllm-openai:v0.32.0`), and each sweep as `tpw-sweep --steps 8
---concurrency 1,32 --duration 15 --repeats 2 --settle 5`, all eight cards at once.
+four serving Qwen3-14B. Each card is normalised to its own uncapped run; figures are the median
+across a model's four cards at 32 requests in flight, with ranges spanning the two models.
 
 ### H100 SXM (700 W max, 200 W min)
 
@@ -32,36 +40,25 @@ Each engine ran as `vllm serve MODEL --no-enable-prefix-caching --max-num-seqs 6
 | Prefill speed | 83% | 74–75% | 51–56% | 42–44% | 27–28% |
 | Prefill tokens per joule | +20% | +25–27% | +3–13% | +9–13% | −5 to −3% |
 
-Ranges span the two models. Down to 415 W (59% of max) decode keeps 96% of its speed for about a
-quarter more tokens per joule; its efficiency peaks around 345 W, 8–9% slower. Below that the SM
-clock collapses (to about 345 MHz at 200 W) and decode loses speed faster than it saves power.
-Uncapped, decode draws only 520–535 W, so limits above that leave it untouched, while prefill
-runs at the limit and gets more efficient as it is capped down to 415 W.
-
-![Decode and prefill speed against the power limit, Qwen3-8B on H100 SXM](results/h100-sxm/charts/qwen3-8b/light/speed.png)
-
-Charts: [`results/h100-sxm/charts`](results/h100-sxm/charts).
-
 ### H100 PCIe (350 W max, 200 W min)
 
-| At 245 W (70% of max) | Qwen3-8B | Qwen3-14B |
-| --- | --- | --- |
-| Decode speed, 1 request in flight | 98% | 98% |
-| Decode speed, 32 in flight | 96% | 96% |
-| Prefill speed | 68% | 68% |
-| Decode tokens per joule | +21% | +23% |
-| Prefill tokens per joule | −3% | −3% |
+| Power limit | 305 W | 245 W | 200 W |
+| --- | --- | --- | --- |
+| Decode speed | 100% | 96% | 86–87% |
+| Decode tokens per joule | +2–3% | +21–23% | +33–36% |
+| Prefill speed | 88–90% | 68% | 53% |
+| Prefill tokens per joule | +1–2% | −3% | −8% |
 
-Decode never falls off a cliff here: at the 200 W floor it keeps 86–87%, prefill 53%. At the
-same 200 W the SXM card runs decode at 345 MHz where the PCIe card holds 900 MHz; the bigger board
-appears to spend more of a low limit on things other than the SMs. Prefill gains no efficiency
-from the cap on PCIe.
-One card, GPU 7, drew only about 307 W during prefill even at the 350 W limit, so its uncapped
-prefill baseline is low and it widens the 14B prefill band; without it the median moves by one
-point. Charts: [`results/h100-pcie/charts`](results/h100-pcie/charts).
+Unlike on SXM, prefill gains nothing from the cap on PCIe. One PCIe card, GPU 7, drew only about
+307 W during prefill even at the 350 W limit, which widens the 14B prefill band; without it the
+median moves by one point.
 
-The built-in simulator (`--simulate`) exists to test the pipeline; its numbers are made up and
-every chart it produces is watermarked.
+Charts in light and dark are in [`results/h100-sxm/charts`](results/h100-sxm/charts) and
+[`results/h100-pcie/charts`](results/h100-pcie/charts), beside the raw `gpu*.jsonl` files
+(`gpu0`–`3` Qwen3-8B, `gpu4`–`7` Qwen3-14B). Each engine ran as `vllm serve MODEL
+--no-enable-prefix-caching --max-num-seqs 64 --max-model-len 8192` (image
+`vllm/vllm-openai:v0.32.0`), and each sweep as `tpw-sweep --steps 8 --concurrency 1,32
+--duration 15 --repeats 2 --settle 5`, all eight cards at once.
 
 ## What it measures
 
@@ -131,7 +128,7 @@ watts.
 
 ## Prior art
 
-Power management for LLM inference has been studied before, for example Patel et al.,
+Power management for inference has been studied before, for example Patel et al.,
 *Characterizing Power Management Opportunities for LLMs in the Cloud* (ASPLOS '24), and the
 ML.ENERGY / Zeus work on GPU energy. This repo is a small, reproducible measurement that
 separates prefill from decode on current hardware.

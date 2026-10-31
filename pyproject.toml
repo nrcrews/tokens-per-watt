@@ -1,7 +1,7 @@
 [project]
 name = "tokens-per-watt"
 version = "0.1.0"
-description = "How much LLM inference speed a GPU loses as you cut its power limit, split by prefill and decode."
+description = "How a GPU's power limit changes inference speed and efficiency, split by prefill and decode."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
