@@ -11,8 +11,35 @@ How much LLM inference speed does a GPU lose when you cut its power limit? This 
 Most power-capping results report one blended number. Split, they say something useful: where a
 power budget is the constraint, capping every card can serve more tokens from the same megawatt.
 
-> **No measured results yet.** The built-in simulator (`--simulate`) exists to test the pipeline;
-> its numbers are made up and every chart it produces is watermarked. Do not quote them.
+## Results: H100 PCIe
+
+Eight NVIDIA H100 PCIe cards (350 W max, 200 W min), one vLLM 0.32.0 engine per card: four
+serving Qwen3-8B, four serving Qwen3-14B. Each card is normalised to its own 350 W run, and the
+figures are the median across a model's four cards.
+
+| At 245 W (70% of max) | Qwen3-8B | Qwen3-14B |
+| --- | --- | --- |
+| Decode speed, 1 request in flight | 98% | 98% |
+| Decode speed, 32 in flight | 96% | 96% |
+| Prefill speed, 32 in flight | 68% | 68% |
+| Decode tokens per joule, 32 in flight | +21% | +23% |
+| Prefill tokens per joule, 32 in flight | −3% | −3% |
+
+The expectation holds: decode barely notices the cap and prefill slows with the clock. At the
+200 W floor decode keeps 86–87% at 32 in flight, prefill 53%. Capping doesn't make prefill more
+efficient: it does the same math at a lower clock, so its tokens per joule fall slightly.
+
+![Decode and prefill speed against the power limit, Qwen3-8B](results/h100-pcie/charts/qwen3-8b/light/speed.png)
+
+All charts, light and dark, are in [`results/h100-pcie/charts`](results/h100-pcie/charts); the raw
+measurements are the `gpu*.jsonl` files beside them (`gpu0`–`3` Qwen3-8B, `gpu4`–`7` Qwen3-14B).
+One card, GPU 7, drew only about 307 W during prefill even at the 350 W limit, so its uncapped
+prefill baseline is low and it widens the 14B prefill band; without it the median moves by one
+point. Uncapped, decode at one request in flight draws 260–285 W (GPU 7 about 310 W), so limits
+above that leave it untouched.
+
+The built-in simulator (`--simulate`) exists to test the pipeline; its numbers are made up and
+every chart it produces is watermarked.
 
 ## What it measures
 

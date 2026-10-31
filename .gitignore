@@ -3,3 +3,5 @@ __pycache__/
 *.jsonl
 charts/
 examples/
+!results/**/*.jsonl
+!results/*/charts/
