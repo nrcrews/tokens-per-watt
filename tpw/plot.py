@@ -23,6 +23,7 @@ Metric = Literal["tokens_per_s", "tokens_per_j"]
 SIZE_IN = (8.0, 4.5)  # 1600 x 900 at 200 dpi
 DPI = 200
 KEEP = 95.0  # % of uncapped decode speed that defines the sweet spot
+MIN_LABEL_GAP = 6.0  # percentage points between end labels
 
 FONTS = ["Inter", "Arial", "DejaVu Sans"]
 LINE: dict[str, Any] = {
@@ -209,8 +210,10 @@ def decode_and_prefill(
     fig, ax = c.chart(title, subtitle)
     c.line(ax, decode, metric, 0, "Decode (writing tokens)")
     c.line(ax, prefill, metric, 1, "Prefill (reading the prompt)")
-    c.end_label(ax, decode, metric, "Decode")
-    c.end_label(ax, prefill, metric, "Prefill")
+    # Labels that would overlap are dropped; the legend still names both lines.
+    if abs(shares(decode, metric)[0] - shares(prefill, metric)[0]) >= MIN_LABEL_GAP:
+        c.end_label(ax, decode, metric, "Decode")
+        c.end_label(ax, prefill, metric, "Prefill")
     c.legend(fig, ax)
     watts_axis(ax, [p.limit_w for p in decode])
     return fig, ax
