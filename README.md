@@ -11,32 +11,50 @@ How much LLM inference speed does a GPU lose when you cut its power limit? This 
 Most power-capping results report one blended number. Split, they say something useful: where a
 power budget is the constraint, capping every card can serve more tokens from the same megawatt.
 
-## Results: H100 PCIe
+## Results
 
-Eight NVIDIA H100 PCIe cards (350 W max, 200 W min), one vLLM 0.32.0 engine per card: four
-serving Qwen3-8B, four serving Qwen3-14B. Each card is normalised to its own 350 W run, and the
-figures are the median across a model's four cards.
+Two eight-card H100 machines, one vLLM 0.32.0 engine per card: four cards serving Qwen3-8B,
+four serving Qwen3-14B. Each card is normalised to its own uncapped run, and the figures are the
+median across a model's four cards, at 32 requests in flight unless noted. Raw measurements are
+the `gpu*.jsonl` files in each results folder (`gpu0`–`3` Qwen3-8B, `gpu4`–`7` Qwen3-14B), next to
+every chart in light and dark.
+
+### H100 SXM (700 W max, 200 W min)
+
+| Power limit | 485 W | 415 W | 345 W | 270 W | 200 W |
+| --- | --- | --- | --- | --- | --- |
+| Decode speed | 96–99% | 96% | 91–92% | 71% | 51–58% |
+| Decode tokens per joule | +5–12% | +23–27% | +41–45% | +41–45% | +29–36% |
+| Prefill speed | 83% | 74–75% | 51–56% | 42–44% | 27–28% |
+| Prefill tokens per joule | +20% | +25–27% | +3–13% | +9–13% | −5 to −3% |
+
+Ranges span the two models. Down to 415 W (59% of max) decode keeps 96% of its speed for about a
+quarter more tokens per joule; its efficiency peaks around 345 W, 8–9% slower. Below that the SM
+clock collapses (to about 345 MHz at 200 W) and decode loses speed faster than it saves power.
+Uncapped, decode draws only 520–535 W, so limits above that leave it untouched, while prefill
+runs at the limit and gets more efficient as it is capped down to 415 W.
+
+![Decode and prefill speed against the power limit, Qwen3-8B on H100 SXM](results/h100-sxm/charts/qwen3-8b/light/speed.png)
+
+Charts: [`results/h100-sxm/charts`](results/h100-sxm/charts).
+
+### H100 PCIe (350 W max, 200 W min)
 
 | At 245 W (70% of max) | Qwen3-8B | Qwen3-14B |
 | --- | --- | --- |
 | Decode speed, 1 request in flight | 98% | 98% |
 | Decode speed, 32 in flight | 96% | 96% |
-| Prefill speed, 32 in flight | 68% | 68% |
-| Decode tokens per joule, 32 in flight | +21% | +23% |
-| Prefill tokens per joule, 32 in flight | −3% | −3% |
+| Prefill speed | 68% | 68% |
+| Decode tokens per joule | +21% | +23% |
+| Prefill tokens per joule | −3% | −3% |
 
-The expectation holds: decode barely notices the cap and prefill slows with the clock. At the
-200 W floor decode keeps 86–87% at 32 in flight, prefill 53%. Capping doesn't make prefill more
-efficient: it does the same math at a lower clock, so its tokens per joule fall slightly.
-
-![Decode and prefill speed against the power limit, Qwen3-8B](results/h100-pcie/charts/qwen3-8b/light/speed.png)
-
-All charts, light and dark, are in [`results/h100-pcie/charts`](results/h100-pcie/charts); the raw
-measurements are the `gpu*.jsonl` files beside them (`gpu0`–`3` Qwen3-8B, `gpu4`–`7` Qwen3-14B).
+Decode never falls off a cliff here: at the 200 W floor it keeps 86–87%, prefill 53%. At the
+same 200 W the SXM card runs decode at 345 MHz where the PCIe card holds 900 MHz; the bigger board
+appears to spend more of a low limit on things other than the SMs. Prefill gains no efficiency
+from the cap on PCIe.
 One card, GPU 7, drew only about 307 W during prefill even at the 350 W limit, so its uncapped
 prefill baseline is low and it widens the 14B prefill band; without it the median moves by one
-point. Uncapped, decode at one request in flight draws 260–285 W (GPU 7 about 310 W), so limits
-above that leave it untouched.
+point. Charts: [`results/h100-pcie/charts`](results/h100-pcie/charts).
 
 The built-in simulator (`--simulate`) exists to test the pipeline; its numbers are made up and
 every chart it produces is watermarked.
