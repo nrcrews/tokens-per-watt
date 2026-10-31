@@ -1,25 +1,22 @@
-"""Closed-loop load against an OpenAI-compatible completions endpoint (vLLM, SGLang).
-
-Prompts are random token IDs: their length is exact and no two share a prefix, so the
-prefix cache cannot skip prefill. `ignore_eos` holds every decode to its full length.
-"""
+"""Closed-loop load against an OpenAI-compatible completions endpoint such as vLLM or SGLang."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import random
-import statistics
 import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 
 Kind = Literal["decode", "prefill"]
+KINDS: tuple[Kind, ...] = ("decode", "prefill")
 
-# Inside every common tokenizer's vocabulary and clear of special tokens.
-TOKEN_ID_RANGE = (1000, 30000)
+# Random token IDs give prompts an exact length and no shared prefix to cache.
+TOKEN_IDS = range(1000, 30000)
+DECODE_PROMPT_TOKENS = 32
 
 
 @dataclass(frozen=True)
@@ -28,14 +25,15 @@ class Workload:
     concurrency: int
     duration_s: float
     decode_tokens: int = 512
-    decode_prompt_tokens: int = 32
     prefill_tokens: int = 4096
 
-    def request_shape(self) -> tuple[int, int]:
-        """(prompt tokens, output tokens) of each request."""
-        if self.kind == "decode":
-            return self.decode_prompt_tokens, self.decode_tokens
-        return self.prefill_tokens, 1
+    @property
+    def prompt_tokens(self) -> int:
+        return DECODE_PROMPT_TOKENS if self.kind == "decode" else self.prefill_tokens
+
+    @property
+    def output_tokens(self) -> int:
+        return self.decode_tokens if self.kind == "decode" else 1
 
 
 @dataclass
@@ -53,39 +51,26 @@ class LoadResult:
 
 
 def percentile(values: list[float], q: float) -> float | None:
+    """Nearest-rank percentile, `q` in [0, 1]."""
     if not values:
         return None
-    if len(values) == 1:
-        return values[0]
-    return statistics.quantiles(values, n=100, method="inclusive")[round(q * 100) - 1]
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
 
 
 async def _request(
-    client: httpx.AsyncClient, url: str, model: str, prompt: list[int], max_tokens: int, out: LoadResult
+    client: httpx.AsyncClient, url: str, body: dict[str, Any], out: LoadResult
 ) -> None:
-    body = {
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0,
-        "ignore_eos": True,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
     start = time.perf_counter()
     last: float | None = None
     usage = None
     async with client.stream("POST", f"{url}/v1/completions", json=body) as response:
         response.raise_for_status()
         async for line in response.aiter_lines():
-            if not line.startswith("data: "):
+            if not line.startswith("data: ") or line == "data: [DONE]":
                 continue
-            data = line[len("data: ") :]
-            if data == "[DONE]":
-                break
-            chunk = json.loads(data)
-            if chunk.get("usage"):
-                usage = chunk["usage"]
+            chunk = json.loads(line.removeprefix("data: "))
+            usage = chunk.get("usage") or usage
             if chunk.get("choices"):
                 now = time.perf_counter()
                 if last is None:
@@ -93,8 +78,9 @@ async def _request(
                 else:
                     out.chunk_gaps_s.append(now - last)
                 last = now
+
     if usage is None:
-        raise RuntimeError("the server sent no usage; it must support stream_options.include_usage")
+        raise RuntimeError("no usage in the stream; the server must honor stream_options")
     out.requests += 1
     out.prompt_tokens += usage["prompt_tokens"]
     out.output_tokens += usage["completion_tokens"]
@@ -103,17 +89,27 @@ async def _request(
 async def run(url: str, model: str, workload: Workload, seed: int = 0) -> LoadResult:
     """Keeps `concurrency` requests in flight for `duration_s`, then lets the last ones finish."""
     rng = random.Random(seed)
-    prompt_len, max_tokens = workload.request_shape()
     out = LoadResult()
     limits = httpx.Limits(max_connections=workload.concurrency + 4)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(900), limits=limits) as client:
+
+    def body() -> dict[str, Any]:
+        return {
+            "model": model,
+            "prompt": rng.choices(TOKEN_IDS, k=workload.prompt_tokens),
+            "max_tokens": workload.output_tokens,
+            "temperature": 0,
+            "ignore_eos": True,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+    async with httpx.AsyncClient(timeout=900, limits=limits) as client:
         start = time.perf_counter()
         deadline = start + workload.duration_s
 
         async def worker() -> None:
             while time.perf_counter() < deadline:
-                prompt = [rng.randrange(*TOKEN_ID_RANGE) for _ in range(prompt_len)]
-                await _request(client, url, model, prompt, max_tokens, out)
+                await _request(client, url, body(), out)
 
         await asyncio.gather(*(worker() for _ in range(workload.concurrency)))
         out.elapsed_s = time.perf_counter() - start

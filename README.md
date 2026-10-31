@@ -85,6 +85,12 @@ Power management for LLM inference has been studied before, for example Patel et
 ML.ENERGY / Zeus work on GPU energy. This repo is a small, reproducible measurement that
 separates prefill from decode on current hardware.
 
+## Development
+
+```bash
+uv run ruff format && uv run ruff check && uv run mypy && uv run pytest
+```
+
 ## License
 
 MIT

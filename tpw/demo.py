@@ -1,7 +1,4 @@
-"""Streams one long answer with a live status bar: tokens per second, watts, power limit.
-
-Run two side by side, one per GPU, one of them capped (scripts/demo.sh does this in tmux).
-"""
+"""Streams one long answer under a live status bar: tokens per second, watts, power limit."""
 
 from __future__ import annotations
 
@@ -14,16 +11,18 @@ import time
 
 import httpx
 
-from tpw.gpu import Gpu, NvmlGpu
+from tpw.gpu import NvmlGpu
 
 PROMPT = (
     "Write a long, detailed story about a lighthouse keeper who discovers that the lighthouse "
     "is also a radio telescope. Keep going for as long as you can."
 )
+WINDOW_S = 2.0
+REFRESH_S = 0.25
 
 
 class StatusBar:
-    """Pins one line to the bottom of the terminal; text scrolls above it."""
+    """Pins one line to the bottom of the terminal while text scrolls above it."""
 
     def __init__(self) -> None:
         self.rows = shutil.get_terminal_size().lines
@@ -37,6 +36,23 @@ class StatusBar:
         sys.stdout.write(f"\033[r\033[{self.rows};1H\n")
 
 
+class Rate:
+    """Events per second over a sliding window."""
+
+    def __init__(self, window_s: float) -> None:
+        self.window_s = window_s
+        self.times: collections.deque[float] = collections.deque()
+
+    def tick(self, now: float) -> None:
+        self.times.append(now)
+        while now - self.times[0] > self.window_s:
+            self.times.popleft()
+
+    def per_s(self) -> float:
+        span = self.times[-1] - self.times[0] if self.times else 0.0
+        return (len(self.times) - 1) / span if span else 0.0
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--url", default="http://localhost:8000")
@@ -46,7 +62,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--max-tokens", type=int, default=2000)
     args = p.parse_args(argv)
 
-    gpu: Gpu = NvmlGpu(args.gpu)
+    gpu = NvmlGpu(args.gpu)
     body = {
         "model": args.model,
         "messages": [{"role": "user", "content": PROMPT}],
@@ -54,28 +70,23 @@ def main(argv: list[str] | None = None) -> None:
         "temperature": 0,
         "stream": True,
     }
-    arrivals: collections.deque[float] = collections.deque()
-    bar = StatusBar()
-    shown = 0.0
+    rate, bar, shown = Rate(WINDOW_S), StatusBar(), 0.0
+
     try:
         with httpx.stream("POST", f"{args.url}/v1/chat/completions", json=body, timeout=600) as r:
             r.raise_for_status()
             for line in r.iter_lines():
                 if not line.startswith("data: ") or line == "data: [DONE]":
                     continue
-                choices = json.loads(line[len("data: ") :]).get("choices") or [{}]
-                text = choices[0].get("delta", {}).get("content") or ""
+                choices = json.loads(line.removeprefix("data: "))["choices"]
+                sys.stdout.write((choices[0]["delta"].get("content") if choices else None) or "")
+
                 now = time.perf_counter()
-                arrivals.append(now)
-                while arrivals and now - arrivals[0] > 2.0:
-                    arrivals.popleft()
-                sys.stdout.write(text)
-                if now - shown > 0.25:
-                    rate = (len(arrivals) - 1) / (arrivals[-1] - arrivals[0]) if len(arrivals) > 1 else 0.0
-                    bar.show(
-                        f"{args.label}  {rate:5.1f} tok/s   {gpu.power_w():4.0f} W"
-                        f"   limit {gpu.limit_w():.0f} W"
-                    )
+                rate.tick(now)
+                if now - shown > REFRESH_S:
+                    speed = f"{rate.per_s():5.1f} tok/s"
+                    power = f"{gpu.power_w():4.0f} W   limit {gpu.limit_w():.0f} W"
+                    bar.show(f"{args.label}  {speed}   {power}")
                     shown = now
     finally:
         bar.close()
