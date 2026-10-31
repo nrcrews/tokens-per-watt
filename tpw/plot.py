@@ -1,4 +1,8 @@
-"""Turns a sweep's results.jsonl into charts whose titles are computed from the data."""
+"""Turns sweep results into charts whose titles are computed from the data.
+
+Given several results files (one per GPU), each chip is normalised to its own uncapped run,
+lines show the median across chips and a shaded band shows their range.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
 Metric = Literal["tokens_per_s", "tokens_per_j"]
+Key = tuple[str, int]
 
 SIZE_IN = (8.0, 4.5)  # 1600 x 900 at 200 dpi
 DPI = 200
@@ -26,25 +31,9 @@ KEEP = 95.0  # % of uncapped decode speed that defines the sweet spot
 MIN_LABEL_GAP = 6.0  # percentage points between end labels
 
 FONTS = ["Inter", "Arial", "DejaVu Sans"]
-LINE: dict[str, Any] = {
-    "linewidth": 1.75,
-    "marker": "o",
-    "markersize": 6.5,
-    "markeredgewidth": 1.5,
-    "zorder": 3,
-}
-END_LABEL: dict[str, Any] = {
-    "xytext": (-10, 0),
-    "textcoords": "offset points",
-    "ha": "right",
-    "va": "center",
-}
-LEGEND: dict[str, Any] = {
-    "loc": "upper left",
-    "bbox_to_anchor": (0.03, 0.835),
-    "frameon": False,
-    "fontsize": 9,
-}
+LINE: dict[str, Any] = {"linewidth": 1.75, "marker": "o", "markersize": 6.5, "zorder": 3}
+END_LABEL: dict[str, Any] = {"xytext": (-10, 0), "textcoords": "offset points", "va": "center"}
+LEGEND: dict[str, Any] = {"loc": "upper left", "bbox_to_anchor": (0.03, 0.835), "frameon": False}
 WATERMARK: dict[str, Any] = {"fontsize": 32, "fontweight": "bold", "alpha": 0.22, "rotation": 18}
 
 
@@ -92,7 +81,17 @@ class Point:
     mean_power_w: float
 
 
-Series = dict[tuple[str, int], list[Point]]
+@dataclass(frozen=True)
+class Band:
+    """A metric at one limit as a % of uncapped: the median across chips and their range."""
+
+    limit_w: float
+    mid: float
+    low: float
+    high: float
+
+
+Series = dict[Key, list[Point]]
 
 
 def load(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -111,7 +110,7 @@ def summarize(runs: list[dict[str, Any]]) -> Series:
     for run in runs:
         groups[(run["kind"], run["concurrency"], run["limit_w"])].append(run)
 
-    series: defaultdict[tuple[str, int], list[Point]] = defaultdict(list)
+    series: defaultdict[Key, list[Point]] = defaultdict(list)
     for (kind, concurrency, limit), rows in sorted(groups.items()):
         metrics = (_median(rows, key) for key in ("tokens_per_s", "tokens_per_j", "mean_power_w"))
         series[(kind, concurrency)].append(Point(limit, *metrics))
@@ -124,22 +123,33 @@ def shares(points: list[Point], metric: Metric) -> list[float]:
     return [100 * getattr(p, metric) / base for p in points]
 
 
-def share_at(points: list[Point], limit_w: float, metric: Metric) -> float:
-    return shares(points, metric)[[p.limit_w for p in points].index(limit_w)]
+def bands(chips: list[Series], key: Key, metric: Metric) -> list[Band]:
+    limits = [p.limit_w for p in chips[0][key]]
+    if any([p.limit_w for p in chip[key]] != limits for chip in chips):
+        raise ValueError("every chip must be swept over the same power limits")
+    per_chip = [shares(chip[key], metric) for chip in chips]
+    return [
+        Band(limit, statistics.median(values), min(values), max(values))
+        for limit, values in zip(limits, zip(*per_chip, strict=True), strict=True)
+    ]
 
 
-def sweet_spot(points: list[Point], keep: float = KEEP) -> Point:
+def at(curve: list[Band], limit_w: float) -> float:
+    return next(b.mid for b in curve if b.limit_w == limit_w)
+
+
+def sweet_spot(speed: list[Band], keep: float = KEEP) -> float:
     """The lowest limit at which it and every higher limit keep `keep`% of full speed."""
-    speeds = shares(points, "tokens_per_s")
-    i = len(points) - 1
-    while i > 0 and speeds[i - 1] >= keep:
+    i = len(speed) - 1
+    while i > 0 and speed[i - 1].mid >= keep:
         i -= 1
-    return points[i]
+    return speed[i].limit_w
 
 
 class Canvas:
-    def __init__(self, meta: dict[str, Any], theme: Theme) -> None:
+    def __init__(self, meta: dict[str, Any], chips: int, theme: Theme) -> None:
         self.meta = meta
+        self.chips = chips
         self.t = theme
         plt.rcParams["font.sans-serif"] = FONTS
 
@@ -165,25 +175,31 @@ class Canvas:
     def source(self, fig: Figure) -> None:
         """The footer naming what was measured, and a watermark on simulated data."""
         m = self.meta
-        footer = f"{m['gpu']} · {m['model']} · engine {m['engine_version']} · GPU power from NVML"
+        gpu = (
+            f"{m['gpu']}, median of {self.chips} chips (band: range)"
+            if self.chips > 1
+            else m["gpu"]
+        )
+        footer = f"{gpu} · {m['model']} · vLLM {m['engine_version']} · GPU power from NVML"
         fig.text(0.04, 0.035, footer, fontsize=7.5, color=self.t.muted)
         if m["simulated"]:
             mark = "SIMULATED — NOT MEASURED"
             fig.text(0.5, 0.48, mark, color=self.t.muted, ha="center", va="center", **WATERMARK)
 
-    def line(self, ax: Axes, points: list[Point], metric: Metric, slot: int, label: str) -> None:
-        xs, ys = [p.limit_w for p in points], shares(points, metric)
+    def line(self, ax: Axes, curve: list[Band], slot: int, label: str) -> None:
+        xs, color = [b.limit_w for b in curve], self.t.series[slot]
+        ax.fill_between(xs, [b.low for b in curve], [b.high for b in curve], color=color, alpha=0.1)
         # A surface-coloured marker edge keeps dots legible where lines cross.
-        ax.plot(xs, ys, label=label, color=self.t.series[slot], mec=self.t.surface, **LINE)
+        ax.plot(xs, [b.mid for b in curve], label=label, color=color, mec=self.t.surface, **LINE)
 
-    def end_label(self, ax: Axes, points: list[Point], metric: Metric, text: str) -> None:
+    def end_label(self, ax: Axes, curve: list[Band], text: str) -> None:
         """Labels a line at its lowest limit, where the lines spread apart."""
-        xy = (points[0].limit_w, shares(points, metric)[0])
-        ax.annotate(text, xy, fontsize=9, color=self.t.ink, **END_LABEL)
+        xy = (curve[0].limit_w, curve[0].mid)
+        ax.annotate(text, xy, ha="right", fontsize=9, color=self.t.ink, **END_LABEL)
 
     def legend(self, fig: Figure, ax: Axes) -> None:
         handles, labels = ax.get_legend_handles_labels()
-        legend = fig.legend(handles, labels, ncol=len(labels), **LEGEND)
+        legend = fig.legend(handles, labels, ncol=len(labels), fontsize=9, **LEGEND)
         for text in legend.get_texts():
             text.set_color(self.t.ink2)
 
@@ -204,29 +220,29 @@ def percent_axis(ax: Axes, low: float = 0, high: float = 108) -> None:
 
 
 def decode_and_prefill(
-    c: Canvas, s: Series, concurrency: int, metric: Metric, title: str, subtitle: str
+    c: Canvas, decode: list[Band], prefill: list[Band], title: str, subtitle: str
 ) -> tuple[Figure, Axes]:
-    decode, prefill = s[("decode", concurrency)], s[("prefill", concurrency)]
     fig, ax = c.chart(title, subtitle)
-    c.line(ax, decode, metric, 0, "Decode (writing tokens)")
-    c.line(ax, prefill, metric, 1, "Prefill (reading the prompt)")
+    c.line(ax, decode, 0, "Decode (writing tokens)")
+    c.line(ax, prefill, 1, "Prefill (reading the prompt)")
     # Labels that would overlap are dropped; the legend still names both lines.
-    if abs(shares(decode, metric)[0] - shares(prefill, metric)[0]) >= MIN_LABEL_GAP:
-        c.end_label(ax, decode, metric, "Decode")
-        c.end_label(ax, prefill, metric, "Prefill")
+    if abs(decode[0].mid - prefill[0].mid) >= MIN_LABEL_GAP:
+        c.end_label(ax, decode, "Decode")
+        c.end_label(ax, prefill, "Prefill")
     c.legend(fig, ax)
-    watts_axis(ax, [p.limit_w for p in decode])
+    watts_axis(ax, [b.limit_w for b in decode])
     return fig, ax
 
 
-def speed_chart(c: Canvas, s: Series, concurrency: int, out: Path) -> None:
-    decode, prefill = s[("decode", concurrency)], s[("prefill", concurrency)]
-    spot, top = sweet_spot(decode).limit_w, decode[-1].limit_w
-    d, p = share_at(decode, spot, "tokens_per_s"), share_at(prefill, spot, "tokens_per_s")
+def speed_chart(c: Canvas, chips: list[Series], concurrency: int, out: Path) -> None:
+    decode = bands(chips, ("decode", concurrency), "tokens_per_s")
+    prefill = bands(chips, ("prefill", concurrency), "tokens_per_s")
+    spot, top = sweet_spot(decode), decode[-1].limit_w
+    d, p = at(decode, spot), at(prefill, spot)
     title = f"At {spot:.0f} W, decode keeps {d:.0f}% of its speed. Prefill keeps {p:.0f}%."
     subtitle = f"Throughput as a share of the uncapped {top:.0f} W, {concurrency} in flight"
 
-    fig, ax = decode_and_prefill(c, s, concurrency, "tokens_per_s", title, subtitle)
+    fig, ax = decode_and_prefill(c, decode, prefill, title, subtitle)
     ax.axvspan(spot, top, color=c.t.wash, zorder=0, linewidth=0)
     band = f"decode keeps ≥{KEEP:.0f}%"
     ax.text((spot + top) / 2, 6, band, ha="center", fontsize=8.5, color=c.t.ink2)
@@ -234,52 +250,53 @@ def speed_chart(c: Canvas, s: Series, concurrency: int, out: Path) -> None:
     c.save(fig, out / "speed.png")
 
 
-def efficiency_chart(c: Canvas, s: Series, concurrency: int, out: Path) -> None:
-    decode, prefill = s[("decode", concurrency)], s[("prefill", concurrency)]
-    spot, top = sweet_spot(decode).limit_w, decode[-1].limit_w
-    gain = share_at(decode, spot, "tokens_per_j") - 100
-    title = f"Capped at {spot:.0f} W, decode gets {gain:+.0f}% tokens per joule"
+def efficiency_chart(c: Canvas, chips: list[Series], concurrency: int, out: Path) -> None:
+    speed = bands(chips, ("decode", concurrency), "tokens_per_s")
+    decode = bands(chips, ("decode", concurrency), "tokens_per_j")
+    prefill = bands(chips, ("prefill", concurrency), "tokens_per_j")
+    spot, top = sweet_spot(speed), decode[-1].limit_w
+    title = f"Capped at {spot:.0f} W, decode gets {at(decode, spot) - 100:+.0f}% tokens per joule"
     subtitle = f"Tokens per joule as a share of the uncapped {top:.0f} W, {concurrency} in flight"
 
-    fig, ax = decode_and_prefill(c, s, concurrency, "tokens_per_j", title, subtitle)
+    fig, ax = decode_and_prefill(c, decode, prefill, title, subtitle)
     ax.axhline(100, color=c.t.axis, linewidth=0.75, zorder=1)
-    values = shares(decode, "tokens_per_j") + shares(prefill, "tokens_per_j")
+    values = [v for b in decode + prefill for v in (b.low, b.high)]
     percent_axis(ax, min(80.0, min(values) - 5), max(values) + 10)
     c.save(fig, out / "efficiency.png")
 
 
-def concurrency_chart(c: Canvas, s: Series, out: Path) -> None:
-    keys = sorted(key for key in s if key[0] == "decode")[:3]
+def concurrency_chart(c: Canvas, chips: list[Series], out: Path) -> None:
+    keys = sorted(key for key in chips[0] if key[0] == "decode")[:3]
     if len(keys) < 2:
         return
-    spot = sweet_spot(s[keys[-1]]).limit_w
-    kept = ", ".join(f"{share_at(s[k], spot, 'tokens_per_s'):.0f}% at {k[1]}" for k in keys)
+    curves = {n: bands(chips, (kind, n), "tokens_per_s") for kind, n in keys}
+    spot = sweet_spot(curves[max(curves)])
+    kept = ", ".join(f"{at(curve, spot):.0f}% at {n}" for n, curve in curves.items())
     title = f"At {spot:.0f} W, decode keeps {kept} in flight"
     subtitle = "Decode throughput as a share of uncapped, by requests in flight"
 
     fig, ax = c.chart(title, subtitle)
-    for slot, key in enumerate(keys):
-        c.line(ax, s[key], "tokens_per_s", slot, f"{key[1]} in flight")
+    for slot, (n, curve) in enumerate(curves.items()):
+        c.line(ax, curve, slot, f"{n} in flight")
     c.legend(fig, ax)
-    watts_axis(ax, [p.limit_w for p in s[keys[-1]]])
+    watts_axis(ax, [b.limit_w for b in curves[max(curves)]])
     percent_axis(ax)
     c.save(fig, out / "concurrency.png")
 
 
-def headline(c: Canvas, s: Series, concurrency: int, out: Path) -> None:
+def headline(c: Canvas, chips: list[Series], concurrency: int, out: Path) -> None:
     """The one number: more decode tokens from the same power budget, at the sweet spot."""
-    decode = s[("decode", concurrency)]
-    spot, top = sweet_spot(decode).limit_w, decode[-1].limit_w
-    gain = share_at(decode, spot, "tokens_per_j") - 100
-    slower = 100 - share_at(decode, spot, "tokens_per_s")
+    speed = bands(chips, ("decode", concurrency), "tokens_per_s")
+    energy = bands(chips, ("decode", concurrency), "tokens_per_j")
+    spot, top = sweet_spot(speed), speed[-1].limit_w
     detail = (
         f"Every GPU capped at {spot:.0f} W ({100 * spot / top:.0f}% of max): "
-        f"decode {slower:.0f}% slower, {concurrency} requests in flight"
+        f"decode {100 - at(speed, spot):.0f}% slower, {concurrency} requests in flight"
     )
     caveat = "GPU power only: CPU, memory and cooling overheads are not counted."
 
     fig = c.blank()
-    big = f"{gain:+.0f}%"
+    big = f"{at(energy, spot) - 100:+.0f}%"
     fig.text(0.07, 0.62, big, fontsize=96, fontweight="bold", va="center", color=c.t.ink)
     fig.text(0.07, 0.36, "more decode tokens from the same megawatt", fontsize=20, color=c.t.ink)
     fig.text(0.07, 0.27, detail, fontsize=11, color=c.t.ink2)
@@ -289,22 +306,26 @@ def headline(c: Canvas, s: Series, concurrency: int, out: Path) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("results", type=Path, nargs="?", default=Path("results.jsonl"))
+    p.add_argument("results", type=Path, nargs="*", default=[Path("results.jsonl")])
     p.add_argument("--out", type=Path, default=Path("charts"))
     p.add_argument("--concurrency", type=int, help="batch for the main charts (default: largest)")
     p.add_argument("--theme", choices=sorted(THEMES), default="light")
     args = p.parse_args(argv)
 
-    meta, runs = load(args.results)
-    s = summarize(runs)
-    concurrency = args.concurrency or max(c for kind, c in s if kind == "decode")
-    canvas = Canvas(meta, THEMES[args.theme])
+    loaded = [load(path) for path in args.results]
+    meta = loaded[0][0]
+    if any((m["gpu"], m["model"]) != (meta["gpu"], meta["model"]) for m, _ in loaded):
+        raise SystemExit("every results file must come from the same GPU type and model")
+    chips = [summarize(runs) for _, runs in loaded]
+
+    concurrency = args.concurrency or max(c for kind, c in chips[0] if kind == "decode")
+    canvas = Canvas(meta, len(chips), THEMES[args.theme])
     args.out.mkdir(parents=True, exist_ok=True)
 
-    speed_chart(canvas, s, concurrency, args.out)
-    efficiency_chart(canvas, s, concurrency, args.out)
-    concurrency_chart(canvas, s, args.out)
-    headline(canvas, s, concurrency, args.out)
+    speed_chart(canvas, chips, concurrency, args.out)
+    efficiency_chart(canvas, chips, concurrency, args.out)
+    concurrency_chart(canvas, chips, args.out)
+    headline(canvas, chips, concurrency, args.out)
     print(f"wrote charts to {args.out}/")
 
 

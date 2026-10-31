@@ -60,6 +60,8 @@ uv run tpw-sweep --simulate --duration 2 --repeats 1 --out sim.jsonl && uv run t
 | `headline.png` | The one number: more decode tokens from the same power budget at the sweet spot |
 
 Every title is computed from the data, so a run that breaks the expected story says so itself.
+Pass several results files, one per GPU (`tpw-plot gpu0.jsonl gpu1.jsonl ...`), and each chip is
+normalised to its own uncapped run: lines show the median across chips, shading their range.
 The **sweet spot** is the lowest limit at which decode, and every higher limit, keeps 95% of its
 uncapped speed.
 

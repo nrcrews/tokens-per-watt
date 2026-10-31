@@ -10,6 +10,10 @@ def point(limit_w: float, tokens_per_s: float) -> plot.Point:
     return plot.Point(limit_w, tokens_per_s, tokens_per_j=1.0, mean_power_w=limit_w)
 
 
+def curve(*mids: tuple[float, float]) -> list[plot.Band]:
+    return [plot.Band(limit, mid, mid, mid) for limit, mid in mids]
+
+
 def test_power_limits_run_from_max_to_min_with_the_steps_between_rounded():
     assert sweep.power_limits(200, 700, 6) == [700, 600, 500, 400, 300, 200]
     assert sweep.power_limits(150.5, 350, 3) == [350, 250, 150.5]
@@ -18,12 +22,12 @@ def test_power_limits_run_from_max_to_min_with_the_steps_between_rounded():
 
 
 def test_sweet_spot_is_the_lowest_limit_that_keeps_speed_all_the_way_up():
-    points = [point(200, 90), point(300, 97), point(400, 93), point(500, 98), point(600, 100)]
-    assert plot.sweet_spot(points).limit_w == 500
+    speed = curve((200, 90), (300, 97), (400, 93), (500, 98), (600, 100))
+    assert plot.sweet_spot(speed) == 500
 
 
 def test_sweet_spot_is_the_max_when_any_cut_costs_too_much():
-    assert plot.sweet_spot([point(500, 80), point(600, 100)]).limit_w == 600
+    assert plot.sweet_spot(curve((500, 80), (600, 100))) == 600
 
 
 def test_summarize_takes_the_median_of_repeats_in_limit_order():
@@ -33,6 +37,23 @@ def test_summarize_takes_the_median_of_repeats_in_limit_order():
 
     points = plot.summarize(runs)[("decode", 1)]
     assert points == [plot.Point(200, 5, 1, 1), plot.Point(300, 20, 1, 1)]
+
+
+def test_bands_normalise_each_chip_then_take_the_median_and_range():
+    key = ("decode", 8)
+    chips = [{key: [point(300, 90 * scale), point(400, 100 * scale)]} for scale in (1, 2, 3)]
+    chips[2][key][0] = point(300, 3 * 80)
+
+    low, top = plot.bands(chips, key, "tokens_per_s")
+    assert low == plot.Band(300, mid=90, low=80, high=90)
+    assert top == plot.Band(400, mid=100, low=100, high=100)
+
+
+def test_bands_refuse_chips_swept_over_different_limits():
+    key = ("decode", 8)
+    chips = [{key: [point(300, 1), point(400, 1)]}, {key: [point(250, 1), point(400, 1)]}]
+    with pytest.raises(ValueError):
+        plot.bands(chips, key, "tokens_per_s")
 
 
 def test_percentile_is_nearest_rank():
