@@ -32,11 +32,12 @@ def test_sweet_spot_is_the_max_when_any_cut_costs_too_much():
 
 def test_summarize_takes_the_median_of_repeats_in_limit_order():
     run = {"kind": "decode", "concurrency": 1, "tokens_per_j": 1, "mean_power_w": 1}
+    run["median_sm_clock_mhz"] = 1
     speeds = [(300, 10), (300, 30), (300, 20), (200, 5)]
     runs = [{**run, "limit_w": w, "tokens_per_s": s} for w, s in speeds]
 
     points = plot.summarize(runs)[("decode", 1)]
-    assert points == [plot.Point(200, 5, 1, 1), plot.Point(300, 20, 1, 1)]
+    assert points == [plot.Point(200, 5, 1, 1, 1), plot.Point(300, 20, 1, 1, 1)]
 
 
 def test_bands_normalise_each_chip_then_take_the_median_and_range():
@@ -47,6 +48,34 @@ def test_bands_normalise_each_chip_then_take_the_median_and_range():
     low, top = plot.bands(chips, key, "tokens_per_s")
     assert low == plot.Band(300, mid=90, low=80, high=90)
     assert top == plot.Band(400, mid=100, low=100, high=100)
+
+
+def test_bands_can_keep_raw_values():
+    key = ("decode", 8)
+    chips = [{key: [plot.Point(300, 1, 1, 1, sm_clock_mhz=900), plot.Point(400, 1, 1, 1, 1980)]}]
+    assert [b.mid for b in plot.bands(chips, key, "sm_clock_mhz", relative=False)] == [900, 1980]
+
+
+def test_titles_give_the_cause_only_when_the_data_shows_it():
+    decode, prefill = (
+        curve((300, 90), (400, 96), (500, 100)),
+        curve((300, 50), (400, 75), (500, 100)),
+    )
+    assert plot.speed_title(decode, prefill, 400) == "A power cap slows prefill, not decode"
+    assert plot.speed_title(decode, decode, 400).startswith("At 400 W")
+
+    rising_then_falling = curve((300, 120), (400, 140), (500, 100))
+    assert plot.efficiency_title(rising_then_falling).endswith("down to 400 W")
+    assert plot.efficiency_title(curve((300, 130), (500, 100))).startswith("Every cut")
+    assert plot.efficiency_title(curve((300, 90), (500, 100))).startswith("A power cap doesn't")
+
+    title, limit = plot.concurrency_title(decode, prefill)
+    assert title.startswith("Bigger batches") and limit == 300
+
+
+def test_holds_until_finds_where_a_curve_leaves_its_uncapped_value():
+    clock = curve((200, 345), (300, 1500), (400, 1950), (500, 1980))
+    assert plot.holds_until(clock, 97) == 400
 
 
 def test_bands_refuse_chips_swept_over_different_limits():
@@ -94,4 +123,4 @@ def test_a_simulated_sweep_records_every_run_and_plots_every_chart(tmp_path: Pat
 
     plot.main([str(results), "--out", str(charts)])
     names = {path.name for path in charts.iterdir()}
-    assert names == {"speed.png", "efficiency.png", "concurrency.png", "headline.png"}
+    assert names == {"speed.png", "clock.png", "efficiency.png", "concurrency.png", "headline.png"}

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
@@ -22,13 +23,14 @@ import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
-Metric = Literal["tokens_per_s", "tokens_per_j"]
+Metric = Literal["tokens_per_s", "tokens_per_j", "sm_clock_mhz"]
 Key = tuple[str, int]
 
 SIZE_IN = (8.0, 4.5)  # 1600 x 900 at 200 dpi
 DPI = 200
 KEEP = 95.0  # % of uncapped decode speed that defines the sweet spot
 MIN_LABEL_GAP = 6.0  # percentage points between end labels
+FULL_CLOCK = 97.0  # % of uncapped clock that still counts as full
 
 FONTS = ["Inter", "Arial", "DejaVu Sans"]
 LINE: dict[str, Any] = {"linewidth": 1.75, "marker": "o", "markersize": 6.5, "zorder": 3}
@@ -79,6 +81,7 @@ class Point:
     tokens_per_s: float
     tokens_per_j: float
     mean_power_w: float
+    sm_clock_mhz: float = math.nan
 
 
 @dataclass(frozen=True)
@@ -101,7 +104,8 @@ def load(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
 
 
 def _median(rows: list[dict[str, Any]], key: str) -> float:
-    return float(statistics.median(row[key] for row in rows))
+    values = [row[key] for row in rows if row.get(key) is not None]
+    return float(statistics.median(values)) if values else math.nan
 
 
 def summarize(runs: list[dict[str, Any]]) -> Series:
@@ -112,7 +116,8 @@ def summarize(runs: list[dict[str, Any]]) -> Series:
 
     series: defaultdict[Key, list[Point]] = defaultdict(list)
     for (kind, concurrency, limit), rows in sorted(groups.items()):
-        metrics = (_median(rows, key) for key in ("tokens_per_s", "tokens_per_j", "mean_power_w"))
+        keys = ("tokens_per_s", "tokens_per_j", "mean_power_w", "median_sm_clock_mhz")
+        metrics = (_median(rows, key) for key in keys)
         series[(kind, concurrency)].append(Point(limit, *metrics))
     return dict(series)
 
@@ -123,11 +128,15 @@ def shares(points: list[Point], metric: Metric) -> list[float]:
     return [100 * getattr(p, metric) / base for p in points]
 
 
-def bands(chips: list[Series], key: Key, metric: Metric) -> list[Band]:
+def bands(chips: list[Series], key: Key, metric: Metric, relative: bool = True) -> list[Band]:
+    """Median and range across chips at each limit, as % of uncapped unless `relative` is off."""
     limits = [p.limit_w for p in chips[0][key]]
     if any([p.limit_w for p in chip[key]] != limits for chip in chips):
         raise ValueError("every chip must be swept over the same power limits")
-    per_chip = [shares(chip[key], metric) for chip in chips]
+    per_chip = [
+        shares(chip[key], metric) if relative else [getattr(p, metric) for p in chip[key]]
+        for chip in chips
+    ]
     return [
         Band(limit, statistics.median(values), min(values), max(values))
         for limit, values in zip(limits, zip(*per_chip, strict=True), strict=True)
@@ -144,6 +153,42 @@ def sweet_spot(speed: list[Band], keep: float = KEEP) -> float:
     while i > 0 and speed[i - 1].mid >= keep:
         i -= 1
     return speed[i].limit_w
+
+
+def holds_until(curve: list[Band], keep: float) -> float:
+    """The lowest limit down to which a curve stays within `keep`% of its uncapped value."""
+    top = curve[-1].mid
+    return sweet_spot([Band(b.limit_w, 100 * b.mid / top, 0, 0) for b in curve], keep)
+
+
+def slows_prefill_not_decode(decode: list[Band], prefill: list[Band], limit_w: float) -> bool:
+    """True when the cap costs prefill at least twice what it costs decode."""
+    return 100 - at(prefill, limit_w) >= 2 * max(100 - at(decode, limit_w), 1.0)
+
+
+def speed_title(decode: list[Band], prefill: list[Band], spot: float) -> str:
+    if slows_prefill_not_decode(decode, prefill, spot):
+        return "A power cap slows prefill, not decode"
+    return (
+        f"At {spot:.0f} W, decode keeps {at(decode, spot):.0f}%, prefill {at(prefill, spot):.0f}%"
+    )
+
+
+def efficiency_title(decode: list[Band]) -> str:
+    peak = max(decode, key=lambda b: b.mid)
+    if peak.mid <= 100:
+        return "A power cap doesn't make decode cheaper here"
+    if peak is decode[0]:
+        return "Every cut makes each decode token cheaper"
+    return f"Lower clocks make each decode token cheaper, down to {peak.limit_w:.0f} W"
+
+
+def concurrency_title(small: list[Band], large: list[Band]) -> tuple[str, float]:
+    """The title and the limit where the larger batch falls furthest behind."""
+    gap, limit = max((s.mid - b.mid, s.limit_w) for s, b in zip(small, large, strict=True))
+    if gap >= 2:
+        return "Bigger batches do more math, so they slow sooner", limit
+    return "Batch size barely changes what the cap costs decode", limit
 
 
 class Canvas:
@@ -239,8 +284,11 @@ def speed_chart(c: Canvas, chips: list[Series], concurrency: int, out: Path) -> 
     prefill = bands(chips, ("prefill", concurrency), "tokens_per_s")
     spot, top = sweet_spot(decode), decode[-1].limit_w
     d, p = at(decode, spot), at(prefill, spot)
-    title = f"At {spot:.0f} W, decode keeps {d:.0f}% of its speed. Prefill keeps {p:.0f}%."
-    subtitle = f"Throughput as a share of the uncapped {top:.0f} W, {concurrency} in flight"
+    title = speed_title(decode, prefill, spot)
+    subtitle = (
+        f"Speed vs uncapped {top:.0f} W, {concurrency} in flight. "
+        f"At {spot:.0f} W decode keeps {d:.0f}%, prefill {p:.0f}%."
+    )
 
     fig, ax = decode_and_prefill(c, decode, prefill, title, subtitle)
     ax.axvspan(spot, top, color=c.t.wash, zorder=0, linewidth=0)
@@ -255,8 +303,12 @@ def efficiency_chart(c: Canvas, chips: list[Series], concurrency: int, out: Path
     decode = bands(chips, ("decode", concurrency), "tokens_per_j")
     prefill = bands(chips, ("prefill", concurrency), "tokens_per_j")
     spot, top = sweet_spot(speed), decode[-1].limit_w
-    title = f"Capped at {spot:.0f} W, decode gets {at(decode, spot) - 100:+.0f}% tokens per joule"
-    subtitle = f"Tokens per joule as a share of the uncapped {top:.0f} W, {concurrency} in flight"
+    title = efficiency_title(decode)
+    subtitle = (
+        f"Tokens per joule vs uncapped {top:.0f} W, {concurrency} in flight. "
+        f"At {spot:.0f} W decode {at(decode, spot) - 100:+.0f}%, "
+        f"prefill {at(prefill, spot) - 100:+.0f}%."
+    )
 
     fig, ax = decode_and_prefill(c, decode, prefill, title, subtitle)
     ax.axhline(100, color=c.t.axis, linewidth=0.75, zorder=1)
@@ -270,10 +322,9 @@ def concurrency_chart(c: Canvas, chips: list[Series], out: Path) -> None:
     if len(keys) < 2:
         return
     curves = {n: bands(chips, (kind, n), "tokens_per_s") for kind, n in keys}
-    spot = sweet_spot(curves[max(curves)])
-    kept = ", ".join(f"{at(curve, spot):.0f}% at {n}" for n, curve in curves.items())
-    title = f"At {spot:.0f} W, decode keeps {kept} in flight"
-    subtitle = "Decode throughput as a share of uncapped, by requests in flight"
+    title, limit = concurrency_title(curves[min(curves)], curves[max(curves)])
+    kept = ", ".join(f"{at(curve, limit):.0f}% with {n}" for n, curve in curves.items())
+    subtitle = f"Decode speed vs uncapped. At {limit:.0f} W: {kept} in flight."
 
     fig, ax = c.chart(title, subtitle)
     for slot, (n, curve) in enumerate(curves.items()):
@@ -282,6 +333,36 @@ def concurrency_chart(c: Canvas, chips: list[Series], out: Path) -> None:
     watts_axis(ax, [b.limit_w for b in curves[max(curves)]])
     percent_axis(ax)
     c.save(fig, out / "concurrency.png")
+
+
+def clock_chart(c: Canvas, chips: list[Series], concurrency: int, out: Path) -> None:
+    decode_key, prefill_key = ("decode", concurrency), ("prefill", concurrency)
+    if any(
+        math.isnan(p.sm_clock_mhz) for chip in chips for p in chip[decode_key] + chip[prefill_key]
+    ):
+        return
+    decode = bands(chips, decode_key, "sm_clock_mhz", relative=False)
+    prefill = bands(chips, prefill_key, "sm_clock_mhz", relative=False)
+    decode_speed = bands(chips, decode_key, "tokens_per_s")
+    prefill_speed = bands(chips, prefill_key, "tokens_per_s")
+    if slows_prefill_not_decode(decode_speed, prefill_speed, sweet_spot(decode_speed)):
+        title = "The cap lowers the clock. Only prefill needs it."
+    else:
+        title = "Core clock under each power limit"
+    full = holds_until(decode, FULL_CLOCK)
+    subtitle = (
+        f"Median core clock in MHz, {concurrency} in flight. "
+        f"Decode holds full clock down to {full:.0f} W."
+    )
+
+    fig, ax = c.chart(title, subtitle)
+    c.line(ax, decode, 0, "Decode (writing tokens)")
+    c.line(ax, prefill, 1, "Prefill (reading the prompt)")
+    c.legend(fig, ax)
+    watts_axis(ax, [b.limit_w for b in decode])
+    ax.set_ylim(0, max(b.high for b in decode + prefill) * 1.12)
+    ax.yaxis.set_major_formatter(lambda value, _: f"{value:,.0f}")
+    c.save(fig, out / "clock.png")
 
 
 def headline(c: Canvas, chips: list[Series], concurrency: int, out: Path) -> None:
@@ -323,6 +404,7 @@ def main(argv: list[str] | None = None) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
 
     speed_chart(canvas, chips, concurrency, args.out)
+    clock_chart(canvas, chips, concurrency, args.out)
     efficiency_chart(canvas, chips, concurrency, args.out)
     concurrency_chart(canvas, chips, args.out)
     headline(canvas, chips, concurrency, args.out)
