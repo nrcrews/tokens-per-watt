@@ -19,6 +19,10 @@ median across a model's four cards, at 32 requests in flight unless noted. Raw m
 the `gpu*.jsonl` files in each results folder (`gpu0`–`3` Qwen3-8B, `gpu4`–`7` Qwen3-14B), next to
 every chart in light and dark.
 
+Each engine ran as `vllm serve MODEL --no-enable-prefix-caching --max-num-seqs 64
+--max-model-len 8192` (image `vllm/vllm-openai:v0.32.0`), and each sweep as `tpw-sweep --steps 8
+--concurrency 1,32 --duration 15 --repeats 2 --settle 5`, all eight cards at once.
+
 ### H100 SXM (700 W max, 200 W min)
 
 | Power limit | 485 W | 415 W | 345 W | 270 W | 200 W |
