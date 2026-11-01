@@ -5,6 +5,8 @@ How a GPU's power limit changes inference speed, measured separately for prefill
 Capped at 415 W instead of 700 W, an H100 SXM keeps 96% of its decode speed and 74–75% of its
 prefill speed. Decode gets 23–27% more tokens per joule.
 
+Write-up: [WRITEUP.md](WRITEUP.md).
+
 ![Decode and prefill speed against the power limit, Qwen3-8B on H100 SXM](results/h100-sxm/charts/qwen3-8b/light/speed.png)
 
 ## Why
